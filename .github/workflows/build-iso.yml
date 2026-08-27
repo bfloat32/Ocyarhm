@@ -1,0 +1,142 @@
+name: Build Ocyarhm ISO
+
+on:
+  workflow_dispatch:
+    inputs:
+      ocyarhm_ref:
+        description: Ocyarhm branch, tag, or commit to package
+        required: true
+        default: quattro
+        type: string
+      iso_ref:
+        description: omacom-io/omarchy-iso branch, tag, or commit
+        required: true
+        default: quattro
+        type: string
+      pkgs_ref:
+        description: omacom-io/omarchy-pkgs branch, tag, or commit
+        required: true
+        default: master
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build from local source checkouts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Check out Ocyarhm source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          path: sources/ocyarhm
+          persist-credentials: false
+          ref: ${{ inputs.ocyarhm_ref }}
+
+      - name: Check out Omarchy ISO builder
+        uses: actions/checkout@v4
+        with:
+          repository: omacom-io/omarchy-iso
+          fetch-depth: 1
+          path: sources/omarchy-iso
+          persist-credentials: false
+          ref: ${{ inputs.iso_ref }}
+          submodules: recursive
+
+      - name: Check out Omarchy package recipes
+        uses: actions/checkout@v4
+        with:
+          repository: omacom-io/omarchy-pkgs
+          fetch-depth: 1
+          path: sources/omarchy-pkgs
+          persist-credentials: false
+          ref: ${{ inputs.pkgs_ref }}
+
+      - name: Reclaim runner disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          docker system prune --all --force
+          df -h /
+
+      - name: Build fresh ISO from local source
+        working-directory: sources/omarchy-iso
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./bin/omarchy-iso-make \
+            --no-cache \
+            --keep-pkg-cache \
+            --no-boot-offer \
+            --local-source \
+            "$GITHUB_WORKSPACE/sources/ocyarhm" \
+            "$GITHUB_WORKSPACE/sources/omarchy-pkgs"
+
+      - name: Collect deliverables and provenance
+        env:
+          REQUESTED_OCYARHM_REF: ${{ inputs.ocyarhm_ref }}
+          REQUESTED_ISO_REF: ${{ inputs.iso_ref }}
+          REQUESTED_PKGS_REF: ${{ inputs.pkgs_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          generated=(sources/omarchy-iso/release/*)
+          (( ${#generated[@]} > 0 )) || {
+            echo "::error::The ISO builder produced no deliverables."
+            exit 1
+          }
+
+          mkdir -p deliverables
+          cp -a -- "${generated[@]}" deliverables/
+
+          isos=(deliverables/*.iso)
+          (( ${#isos[@]} > 0 )) || {
+            echo "::error::The ISO builder produced no ISO file."
+            exit 1
+          }
+
+          ocyarhm_sha=$(GIT_MASTER=1 git -C sources/ocyarhm rev-parse HEAD)
+          iso_sha=$(GIT_MASTER=1 git -C sources/omarchy-iso rev-parse HEAD)
+          pkgs_sha=$(GIT_MASTER=1 git -C sources/omarchy-pkgs rev-parse HEAD)
+          builder_image=$(docker image inspect \
+            --format '{{json .RepoDigests}}' archlinux/archlinux:latest)
+
+          {
+            echo "manifest_version=1"
+            echo "generated_at_utc=$(date --utc --iso-8601=seconds)"
+            echo "github_repository=$GITHUB_REPOSITORY"
+            echo "github_run_id=$GITHUB_RUN_ID"
+            echo "github_run_attempt=$GITHUB_RUN_ATTEMPT"
+            echo "ocyarhm_repository=$GITHUB_REPOSITORY"
+            echo "ocyarhm_requested_ref=$REQUESTED_OCYARHM_REF"
+            echo "ocyarhm_commit=$ocyarhm_sha"
+            echo "omarchy_iso_repository=omacom-io/omarchy-iso"
+            echo "omarchy_iso_requested_ref=$REQUESTED_ISO_REF"
+            echo "omarchy_iso_commit=$iso_sha"
+            echo "omarchy_pkgs_repository=omacom-io/omarchy-pkgs"
+            echo "omarchy_pkgs_requested_ref=$REQUESTED_PKGS_REF"
+            echo "omarchy_pkgs_commit=$pkgs_sha"
+            echo "archlinux_builder_image=$builder_image"
+            echo "runner_image_os=${ImageOS:-unknown}"
+            echo "runner_image_version=${ImageVersion:-unknown}"
+            echo "builder_flags=--no-cache --keep-pkg-cache --no-boot-offer --local-source"
+          } > deliverables/source-manifest.txt
+
+          (
+            cd deliverables
+            sha256sum -- *.iso > SHA256SUMS
+          )
+
+      - name: Upload ISO deliverables
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocyarhm-iso-${{ github.run_id }}-${{ github.run_attempt }}
+          path: deliverables/*
+          if-no-files-found: error
+          retention-days: 14
