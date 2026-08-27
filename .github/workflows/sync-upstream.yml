@@ -1,0 +1,155 @@
+name: Sync Omarchy Upstream
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-omarchy-upstream-quattro
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream into a review branch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out Ocyarhm quattro
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: quattro
+
+      - name: Require the automation credential
+        env:
+          AUTOMATION_TOKEN: ${{ secrets.OCYARHM_AUTOMATION_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z $AUTOMATION_TOKEN ]]; then
+            echo "::error::OCYARHM_AUTOMATION_TOKEN is not configured. Add the dedicated automation credential as a repository Actions secret before running this workflow."
+            exit 1
+          fi
+
+      - name: Merge upstream and push the review branch
+        id: sync
+        env:
+          GH_TOKEN: ${{ secrets.OCYARHM_AUTOMATION_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh auth setup-git --hostname github.com
+          GIT_MASTER=1 git config user.name "github-actions[bot]"
+          GIT_MASTER=1 git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          GIT_MASTER=1 git fetch --no-tags https://github.com/basecamp/omarchy.git \
+            refs/heads/quattro:refs/remotes/omarchy-upstream/quattro
+
+          base_sha=$(GIT_MASTER=1 git rev-parse HEAD)
+          upstream_sha=$(GIT_MASTER=1 git rev-parse refs/remotes/omarchy-upstream/quattro)
+
+          if GIT_MASTER=1 git merge-base --is-ancestor "$upstream_sha" "$base_sha"; then
+            echo "Upstream quattro is already contained in Ocyarhm quattro."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          branch="automation/sync-omarchy-${base_sha:0:12}-${upstream_sha:0:12}"
+          GIT_MASTER=1 git switch --create "$branch" "$base_sha"
+
+          if ! GIT_MASTER=1 git merge --no-ff --no-edit \
+            --message "Merge basecamp/omarchy quattro at ${upstream_sha:0:12}" \
+            "$upstream_sha"; then
+            echo "::error::Upstream merge conflicts with Ocyarhm quattro; no branch was pushed."
+            GIT_MASTER=1 git status --short
+            GIT_MASTER=1 git merge --abort || true
+            exit 1
+          fi
+
+          merge_sha=$(GIT_MASTER=1 git rev-parse HEAD)
+          merge_tree=$(GIT_MASTER=1 git rev-parse "${merge_sha}^{tree}")
+
+          GIT_MASTER=1 git fetch --no-tags origin \
+            refs/heads/quattro:refs/remotes/origin/quattro
+          current_base_sha=$(GIT_MASTER=1 git rev-parse refs/remotes/origin/quattro)
+          if [[ $current_base_sha != "$base_sha" ]]; then
+            echo "::error::Ocyarhm quattro moved during the sync; rerun from the new base."
+            exit 1
+          fi
+
+          set +e
+          GIT_MASTER=1 git ls-remote --exit-code --heads origin "$branch" >/dev/null
+          remote_ref_status=$?
+          set -e
+
+          if (( remote_ref_status == 0 )); then
+            GIT_MASTER=1 git fetch --no-tags origin \
+              "refs/heads/$branch:refs/remotes/origin/$branch"
+            remote_merge_sha=$(GIT_MASTER=1 git rev-parse "refs/remotes/origin/$branch")
+            remote_merge_tree=$(GIT_MASTER=1 git rev-parse "${remote_merge_sha}^{tree}")
+            remote_parents=$(GIT_MASTER=1 git show --no-patch --format=%P "$remote_merge_sha")
+
+            if [[ $remote_parents != "$base_sha $upstream_sha" || $remote_merge_tree != "$merge_tree" ]]; then
+              echo "::error::Existing automation branch does not match the expected merge."
+              exit 1
+            fi
+            echo "Reusing existing branch $branch at $remote_merge_sha."
+          elif (( remote_ref_status == 2 )); then
+            GIT_MASTER=1 git push origin "HEAD:refs/heads/$branch"
+          else
+            echo "::error::Could not determine whether the automation branch already exists."
+            exit "$remote_ref_status"
+          fi
+
+          {
+            echo "has_changes=true"
+            echo "branch=$branch"
+            echo "base_sha=$base_sha"
+            echo "upstream_sha=$upstream_sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open or reuse the upstream sync pull request
+        if: steps.sync.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.OCYARHM_AUTOMATION_TOKEN }}
+          SYNC_BRANCH: ${{ steps.sync.outputs.branch }}
+          BASE_SHA: ${{ steps.sync.outputs.base_sha }}
+          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          pr_url=$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --base quattro \
+            --head "$SYNC_BRANCH" \
+            --state open \
+            --json url \
+            --jq '.[0].url // empty')
+
+          if [[ -n $pr_url ]]; then
+            echo "Reusing $pr_url"
+            exit 0
+          fi
+
+          gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base quattro \
+            --head "$SYNC_BRANCH" \
+            --title "Sync basecamp/omarchy quattro" \
+            --body "$(cat <<EOF
+          Merges \`basecamp/omarchy:quattro\` into Ocyarhm through a review branch.
+
+          - Ocyarhm base: \`$BASE_SHA\`
+          - Omarchy upstream: \`$UPSTREAM_SHA\`
+
+          This pull request is never merged automatically. Maintainers must use **Create a merge commit**. Do not squash or rebase this pull request; retaining the upstream commit as an ancestor is required for safe, idempotent synchronization.
+          EOF
+          )"
