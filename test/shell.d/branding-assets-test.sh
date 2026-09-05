@@ -4,29 +4,6 @@ set -euo pipefail
 
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/base-test.sh"
 
-expected=$(
-  cat <<'WORDMARK'
-  ██████      ██████    ████████      ██████                  ██████      ████████
-██      ██  ██      ██  ██      ██  ██      ██              ██      ██  ██
-██      ██  ██      ██  ██                      ██      ██  ██
-██      ██  ██      ██  ████████    ████████                ██      ██    ██████
-  ████████  ██      ██  ██  ██      ██                      ██      ██          ██
-        ██  ██      ██  ██    ██    ██      ██      ████    ██      ██          ██
-        ██    ██████    ██      ██    ██████        ████      ██████    ████████
-WORDMARK
-)
-
-[[ $(cat "$ROOT/logo.txt") == "$expected" ]] || fail "logo.txt is the qore.os wordmark"
-[[ $(cat "$ROOT/icon.txt") == "$expected" ]] || fail "icon.txt is the qore.os wordmark"
-cmp -s "$ROOT/logo.txt" "$ROOT/icon.txt" || fail "terminal and About defaults share one wordmark"
-(( $(wc -l <"$ROOT/logo.txt") == 7 )) || fail "logo.txt has seven matrix rows"
-(( $(awk 'length > max { max = length } END { print max + 0 }' "$ROOT/logo.txt") == 82 )) || fail "logo.txt is 82 columns wide"
-pass "text branding uses the exact qore.os matrix"
-
-grep -Fq '<title>qore.os</title>' "$ROOT/logo.svg" || fail "logo.svg labels the qore.os wordmark"
-grep -Fq 'shape-rendering="crispEdges"' "$ROOT/logo.svg" || fail "logo.svg keeps pixel geometry crisp"
-pass "SVG branding carries the qore.os identity"
-
 require_command node
 
 node - "$ROOT" <<'NODE'
@@ -36,15 +13,29 @@ const zlib = require("zlib");
 
 const root = process.argv[2];
 const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-const WORDMARK = [
-  "  ██████      ██████    ████████      ██████                  ██████      ████████",
-  "██      ██  ██      ██  ██      ██  ██      ██              ██      ██  ██",
-  "██      ██  ██      ██  ██                      ██      ██  ██",
-  "██      ██  ██      ██  ████████    ████████                ██      ██    ██████",
-  "  ████████  ██      ██  ██  ██      ██                      ██      ██          ██",
-  "        ██  ██      ██  ██    ██    ██      ██      ████    ██      ██          ██",
-  "        ██    ██████    ██      ██    ██████        ████      ██████    ████████",
+const MATRIX = [
+  "01110001110011110001110000000001110001111",
+  "10001010001010001010001000000010001010000",
+  "10001010001010001010000000000010001010000",
+  "10001010001011110011110000000010001001110",
+  "01111010001010100010000000000010001000001",
+  "00001010001010010010001000110010001000001",
+  "00001001110010001001110000110001110011110",
 ];
+if (MATRIX.length !== 7 || MATRIX.some((row) => !/^[01]{41}$/.test(row))) {
+  throw new Error("canonical qore.os matrix is not 41 columns by seven rows");
+}
+const WORDMARK = MATRIX.map((row) => [...row].map((cell) => cell === "1" ? "██" : "  ").join(""));
+const expectedText = WORDMARK.map((row) => row.trimEnd()).join(String.fromCharCode(10)) + String.fromCharCode(10);
+
+for (const relative of ["logo.txt", "icon.txt"]) {
+  if (fs.readFileSync(path.join(root, relative), "utf8") !== expectedText) {
+    throw new Error(`${relative} does not match the canonical qore.os matrix`);
+  }
+}
+if (!fs.readFileSync(path.join(root, "logo.txt")).equals(fs.readFileSync(path.join(root, "icon.txt")))) {
+  throw new Error("terminal and About defaults do not share one wordmark");
+}
 
 const assets = {
   "icon.png": {
@@ -63,10 +54,9 @@ const assets = {
 
 function cells(cellWidth, cellHeight, originX, originY) {
   const result = [];
-  for (let row = 0; row < WORDMARK.length; row++) {
-    const text = WORDMARK[row].padEnd(82, " ");
-    for (let column = 0; column < 41; column++) {
-      if (text.slice(column * 2, column * 2 + 2) === "██") {
+  for (let row = 0; row < MATRIX.length; row++) {
+    for (let column = 0; column < MATRIX[row].length; column++) {
+      if (MATRIX[row][column] === "1") {
         result.push({
           x: originX + column * cellWidth,
           y: originY + row * cellHeight,
@@ -79,28 +69,47 @@ function cells(cellWidth, cellHeight, originX, originY) {
   return result;
 }
 
-function attribute(source, name) {
-  const match = source.match(new RegExp(`\\b${name}="([^"]*)"`));
-  if (!match) throw new Error(`missing SVG ${name} attribute`);
-  return match[1];
+function attributes(source, context) {
+  const parsed = [...source.matchAll(/ ([A-Za-z_:][A-Za-z0-9_.:-]*)="([^"<>&]*)"/g)];
+  if (parsed.map((match) => match[0]).join("") !== source) {
+    throw new Error(`${context} has malformed or unpermitted attributes`);
+  }
+  const values = new Map(parsed.map((match) => [match[1], match[2]]));
+  if (values.size !== parsed.length) throw new Error(`${context} repeats an attribute`);
+  return values;
+}
+
+function requireExactAttributes(actual, expected, context) {
+  if (actual.size !== Object.keys(expected).length) throw new Error(`${context} has unexpected attributes`);
+  for (const [name, value] of Object.entries(expected)) {
+    if (!actual.has(name) || actual.get(name) !== value) throw new Error(`${context} has the wrong ${name} attribute`);
+  }
 }
 
 const svg = fs.readFileSync(path.join(root, "logo.svg"), "utf8");
-const svgRoot = svg.match(/^<svg\b[^>]*>/)?.[0];
-if (!svgRoot) throw new Error("logo.svg has no SVG root");
-if (attribute(svgRoot, "width") !== "1215" || attribute(svgRoot, "height") !== "285" || attribute(svgRoot, "viewBox") !== "0 0 1215 285") {
-  throw new Error("logo.svg has the wrong canvas dimensions");
-}
-if (attribute(svgRoot, "shape-rendering") !== "crispEdges") throw new Error("logo.svg is not crisp");
-if (!svg.includes("<title>qore.os</title>")) throw new Error("logo.svg has the wrong title");
-if (/<text\b|font-family|@import|<use\b/.test(svg)) throw new Error("logo.svg uses text or an external font");
+const documentMatch = svg.match(/^<svg((?: [A-Za-z_:][A-Za-z0-9_.:-]*="[^"<>&]*")*)>\r?\n  <title>qore\.os<\/title>\r?\n((?:  (?:<rect(?: [A-Za-z_:][A-Za-z0-9_.:-]*="[^"<>&]*")*\/>)+\r?\n)+)<\/svg>\r?\n?$/u);
+if (!documentMatch) throw new Error("logo.svg is not a complete permitted SVG document");
+requireExactAttributes(attributes(documentMatch[1], "SVG root"), {
+  xmlns: "http://www.w3.org/2000/svg",
+  width: "1215",
+  height: "285",
+  viewBox: "0 0 1215 285",
+  "shape-rendering": "crispEdges",
+}, "SVG root");
 
-const actualRects = [...svg.matchAll(/<rect\b[^>]*\/>/g)].map((match) => {
-  const source = match[0];
+const actualRects = [...documentMatch[2].matchAll(/<rect((?: [A-Za-z_:][A-Za-z0-9_.:-]*="[^"<>&]*")*)\/>/g)].map((match) => {
+  const rectAttributes = attributes(match[1], "SVG rectangle");
+  requireExactAttributes(rectAttributes, {
+    fill: "black",
+    x: rectAttributes.get("x"),
+    y: rectAttributes.get("y"),
+    width: "25",
+    height: "30",
+  }, "SVG rectangle");
   return {
-    x: Number(attribute(source, "x")), y: Number(attribute(source, "y")),
-    width: Number(attribute(source, "width")), height: Number(attribute(source, "height")),
-    fill: attribute(source, "fill"),
+    x: Number(rectAttributes.get("x")), y: Number(rectAttributes.get("y")),
+    width: Number(rectAttributes.get("width")), height: Number(rectAttributes.get("height")),
+    fill: rectAttributes.get("fill"),
   };
 });
 const expectedRects = cells(25, 30, 95, 37).map((rect) => ({ ...rect, fill: "black" }));
@@ -176,5 +185,7 @@ if (!fs.readFileSync(path.join(root, "default/plymouth/logo.png")).equals(fs.rea
   throw new Error("Plymouth and SDDM logos differ");
 }
 NODE
+pass "text branding uses the exact qore.os matrix"
+pass "SVG branding is a complete permitted qore.os document"
 pass "SVG rectangles and PNG pixels match the canonical matrix and geometry"
 pass "PNG branding assets have valid signatures, dimensions, colors, filters, and parity"
