@@ -5,7 +5,9 @@ autoconf-archive
 asusctl
 base
 base-devel
-broadcom-wl
+# broadcom-wl targets stock linux, while this ISO boots linux-t2. The package
+# is no longer available in the configured repositories, so it cannot be part
+# of the offline ISO mirror.
 btrfs-progs
 dkms
 egl-wayland
